@@ -107,6 +107,8 @@ typedef struct bqws_pt_address {
 	uint8_t address[BQWS_PT_MAX_ADDRESS_SIZE];
 } bqws_pt_address;
 
+typedef struct bqws_pt_noblock_connector bqws_pt_noblock_connector;
+
 typedef struct bqws_pt_init_opts {
 
 	// CA certificate file location
@@ -163,6 +165,11 @@ bool bqws_pt_get_error(bqws_pt_error *err);
 
 bqws_socket *bqws_pt_connect(const char *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts);
 bqws_socket *bqws_pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts);
+
+bqws_pt_noblock_connector *bqws_pt_connect_noblock(const char *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts);
+bqws_pt_noblock_connector *bqws_pt_connect_url_noblock(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts);
+
+bqws_socket *bqws_pt_try_connector(bqws_pt_noblock_connector *connector);
 
 // Server
 

@@ -515,7 +515,7 @@ static void pt_io_close(void *user, bqws_socket *ws)
 	}
 }
 
-static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
+static bqws_socket *pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
 	char url_str[2048];
 	int len = snprintf(url_str, sizeof(url_str), "%s://%s:%d%s", url->scheme, url->host, url->port, url->path);
@@ -680,32 +680,36 @@ static void os_shutdown()
 	WSACleanup();
 }
 
-static bool os_imp_config_data_socket(os_socket s)
-{
-	int res;
-
-	// Set the socket to be non-blocking
+// Set the socket to be non-blocking
+static bool os_imp_config_noblock(os_socket s) {
 	u_long nb_flag = 1;
-	res = ioctlsocket(s, FIONBIO, &nb_flag);
-	if (res != 0) { pt_fail_wsa("ioctlsocket(FIONBIO)"); return false; }
-
-	// Disable Nagle's algorithm to make writes immediate
-	BOOL nd_flag = 1;
-	res = setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nd_flag, sizeof(nd_flag));
-	if (res != 0) { pt_fail_wsa("setsockopt(TCP_NODELAY)"); return false; }
-
-	return true;
+	int res = ioctlsocket(s, FIONBIO, &nb_flag);
+	if (res != 0) { pt_fail_wsa("ioctlsocket(FIONBIO)"); }
+	return res == 0;
 }
 
-static os_socket os_imp_try_connect(ADDRINFOW *info, int family, ADDRINFOW **used)
+// Disable Nagle's algorithm to make writes immediate
+static bool os_imp_config_nodelay(os_socket s) {
+	BOOL nd_flag = 1;
+	int res = setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nd_flag, sizeof(nd_flag));
+	if (res != 0) { pt_fail_wsa("setsockopt(TCP_NODELAY)"); }
+	return res == 0;
+}
+
+static os_socket os_imp_try_connect(ADDRINFOW *info, int family, ADDRINFOW **used, bool blocking)
 {
 	for (; info; info = info->ai_next) {
 		if (info->ai_family != family) continue;
 
 		SOCKET s = socket(family, SOCK_STREAM, IPPROTO_TCP);
 		if (s == INVALID_SOCKET) { pt_fail_wsa("socket()"); return s; }
+		if (!blocking && !os_imp_config_noblock(s)) {
+			return INVALID_SOCKET;
+		}
+
 		int res = connect(s, info->ai_addr, (int)info->ai_addrlen);
-		if (res == 0) {
+		int err = WSAGetLastError();
+		if (res == 0 || (!blocking && err == WSAEWOULDBLOCK)) {
 			*used = info;
 			return s;
 		}
@@ -727,7 +731,7 @@ static void os_imp_parse_address(bqws_pt_address *dst, struct sockaddr *addr)
 	}
 }
 
-static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
+static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr, bool blocking)
 {
 	wchar_t whost[256];
 	char service[32];
@@ -753,9 +757,9 @@ static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
 	}
 
 	ADDRINFOW *used_info = NULL;
-	SOCKET s = os_imp_try_connect(info, AF_INET6, &used_info);
+	SOCKET s = os_imp_try_connect(info, AF_INET, &used_info, blocking);
 	if (s == INVALID_SOCKET) {
-		s = os_imp_try_connect(info, AF_INET, &used_info);
+		s = os_imp_try_connect(info, AF_INET6, &used_info, blocking);
 	}
 
 	if (s != INVALID_SOCKET) {
@@ -764,13 +768,37 @@ static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
 
 	FreeAddrInfoW(info);
 
-	if (!os_imp_config_data_socket(s)) {
+	/* for non blocking connects,
+	       - noblock is already done
+	       - nodelay has to wait until a connection exists */
+	if (blocking && (!os_imp_config_noblock(s) || !os_imp_config_nodelay(s))) {
 		closesocket(s);
 		return INVALID_SOCKET;
 	}
 
 	return s;
 }
+
+static bool pt_noblock_connect_done(const os_socket socket) {
+	fd_set write_fd, except_fd;
+	FD_ZERO(&write_fd);
+	FD_ZERO(&except_fd);
+	FD_SET(socket, &write_fd);
+	FD_SET(socket, &except_fd);
+
+	TIMEVAL tv = {0};
+	if (SOCKET_ERROR == select(0, NULL, &write_fd, &except_fd, &tv)) {
+		pt_fail_wsa("select()");
+		return false;
+	} else if (FD_ISSET(socket, &write_fd)) {
+		return true;
+	} else if (FD_ISSET(socket, &except_fd)) {
+		pt_fail_wsa("pt_noblock_connector_ready()");
+	}
+
+	return false;
+}
+
 
 static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
 {
@@ -787,9 +815,7 @@ static os_socket os_socket_listen(const bqws_pt_listen_opts *pt_opts)
 		if (res != 0) { pt_fail_wsa("setsockopt(IPPROTO_IPV6)"); break; }
 
 		// Set the socket to be non-blocking
-		u_long nb_flag = 1;
-		res = ioctlsocket(s, FIONBIO, &nb_flag);
-		if (res != 0) { pt_fail_wsa("ioctlsocket(FIONBIO)"); break; }
+		if (!os_imp_config_noblock(s)) { break; }
 
 		struct sockaddr_in6 addr = { 0 };
 		addr.sin6_family = AF_INET6;
@@ -819,7 +845,7 @@ static os_socket os_socket_accept(os_socket listen_s, bqws_pt_address *addr)
 
 	os_imp_parse_address(addr, (struct sockaddr*)&addr_in);
 
-	if (!os_imp_config_data_socket(s)) {
+	if (!os_imp_config_noblock(s) || !os_imp_config_nodelay(s)) {
 		closesocket(s);
 		return INVALID_SOCKET;
 	}
@@ -987,7 +1013,7 @@ static os_socket os_socket_connect(const bqws_url *url, bqws_pt_address *addr)
 
 	freeaddrinfo(info);
 
-	if (!os_imp_config_data_socket(s)) {
+	if (!os_imp_config_noblock(s) || !os_imp_config_nodelay(s)) {
 		close(s);
 		return -1;
 	}
@@ -1047,7 +1073,7 @@ static os_socket os_socket_accept(os_socket listen_s, bqws_pt_address *addr)
 
 	os_imp_parse_address(addr, (struct sockaddr*)&addr_in);
 
-	if (!os_imp_config_data_socket(s)) {
+	if (!os_imp_config_noblock(s) || !os_imp_config_nodelay(s)) {
 		close(s);
 		return -1;
 	}
@@ -1523,6 +1549,15 @@ struct bqws_pt_server {
 	bqws_allocator allocator;
 };
 
+typedef struct bqws_pt_noblock_connector {
+	os_socket os_socket;
+	bqws_pt_address addr;
+	bqws_url url;
+	bqws_pt_connect_opts pt_opts;
+	bqws_opts opts;
+	bqws_client_opts client_opts;
+} bqws_pt_noblock_connector;
+
 static size_t io_imp_send(pt_io *io, const void *data, size_t size)
 {
 	if (size == 0) return 0;
@@ -1646,7 +1681,7 @@ static void pt_shutdown()
 	os_shutdown();
 }
 
-static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
+static bqws_socket *pt_connect_os_socket(const os_socket socket, const bqws_pt_address addr, const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
 {
 	pt_io *io = NULL;
 
@@ -1660,8 +1695,7 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 	io->magic = BQWS_PT_IO_MAGIC;
 
         if (!cf_connect(url, &io->cf)) {
-    		bqws_pt_address addr = { BQWS_PT_ADDRESS_UNKNOWN };
-    		io->s = os_socket_connect(url, &addr);
+    		io->s = socket;
     		if (io->s == OS_BAD_SOCKET) break;
 
     		io->address = addr;
@@ -1694,6 +1728,29 @@ static bqws_socket *pt_connect(const bqws_url *url, const bqws_pt_connect_opts *
 
 	if (io) io_free(io);
 	return NULL;
+}
+
+static bqws_socket *pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
+{
+	bqws_pt_address addr = { BQWS_PT_ADDRESS_UNKNOWN };
+	os_socket s = os_socket_connect(url, &addr, true);
+	return pt_connect_os_socket(s, addr, url, pt_opts, opts, client_opts);
+}
+
+static bqws_pt_noblock_connector *pt_connect_url_noblock(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts) {
+	bqws_pt_address addr = { BQWS_PT_ADDRESS_UNKNOWN };
+	os_socket s = os_socket_connect(url, &addr, false);
+
+	bqws_pt_noblock_connector *connector = malloc(sizeof(bqws_pt_noblock_connector));
+	*connector = (bqws_pt_noblock_connector) {
+		.os_socket = s,
+		.addr = addr,
+		.url = *url,
+		.pt_opts = *pt_opts,
+		.opts = *opts,
+		.client_opts = *client_opts,
+	};
+	return connector;
 }
 
 static bqws_pt_server *pt_listen(const bqws_pt_listen_opts *pt_opts)
@@ -1874,7 +1931,68 @@ bqws_socket *bqws_pt_connect_url(const bqws_url *url, const bqws_pt_connect_opts
 	if (!copt.host) copt.host = url->host;
 	if (!copt.path) copt.path = url->path;
 
-	return pt_connect(url, &popt, &opt, &copt);
+	return pt_connect_url(url, &popt, &opt, &copt);
+}
+
+bqws_pt_noblock_connector *bqws_pt_connect_noblock(const char *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
+{
+	bqws_pt_clear_error();
+
+	bqws_url parsed_url;
+	if (!bqws_parse_url(&parsed_url, url)) {
+		pt_fail_pt("bqws_parse_url()", BQWS_PT_ERR_BAD_URL);
+		return NULL;
+	}
+	return bqws_pt_connect_url_noblock(&parsed_url, pt_opts, opts, client_opts);
+}
+
+bqws_pt_noblock_connector *bqws_pt_connect_url_noblock(const bqws_url *url, const bqws_pt_connect_opts *pt_opts, const bqws_opts *opts, const bqws_client_opts *client_opts)
+{
+	bqws_pt_clear_error();
+
+	bqws_pt_connect_opts popt;
+	if (pt_opts) {
+		popt = *pt_opts;
+	} else {
+		memset(&popt, 0, sizeof(popt));
+	}
+
+	bqws_opts opt;
+	if (opts) {
+		opt = *opts;
+	} else {
+		memset(&opt, 0, sizeof(opt));
+	}
+
+	bqws_client_opts copt;
+	if (client_opts) {
+		copt = *client_opts;
+	} else {
+		memset(&copt, 0, sizeof(copt));
+	}
+
+	if (!copt.host) copt.host = url->host;
+	if (!copt.path) copt.path = url->path;
+
+	return pt_connect_url_noblock(url, &popt, &opt, &copt);
+}
+
+bqws_socket *bqws_pt_try_connector(bqws_pt_noblock_connector *connector) {
+	if (connector == NULL) return false;
+
+	if (pt_noblock_connect_done(connector->os_socket)) {
+		bqws_socket *socket = pt_connect_os_socket(
+			connector->os_socket,
+			connector->addr,
+			&connector->url,
+			&connector->pt_opts,
+			&connector->opts,
+			&connector->client_opts);
+		free(connector);
+		return socket;
+	}
+
+	return NULL;
 }
 
 bqws_pt_server *bqws_pt_listen(const bqws_pt_listen_opts *pt_opts)
